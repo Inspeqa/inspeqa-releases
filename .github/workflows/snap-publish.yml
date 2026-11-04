@@ -141,11 +141,21 @@ jobs:
               build-on: [amd64]
               build-for: [amd64]
 
+          # The single-instance plugin owns this D-Bus name; without the slot
+          # the sandbox denies it and every inspeqa:// link opens a new window.
+          slots:
+            single-instance:
+              interface: dbus
+              bus: session
+              name: dev.inspeqa.app.SingleInstance
+
           apps:
             inspeqa:
               command: $BIN
               desktop: $DESKTOP
               extensions: [gnome]
+              slots:
+                - single-instance
               plugs:
                 - home
                 - network
