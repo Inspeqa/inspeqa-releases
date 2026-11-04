@@ -1,0 +1,194 @@
+name: Publish to Snap Store
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (e.g. v0.1.1)
+        required: true
+        type: string
+      channel:
+        description: Snap Store channel
+        required: true
+        default: edge
+        type: choice
+        options: [edge, beta, candidate, stable]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snap-publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  snap:
+    # Host must match the snap base (core24 = Ubuntu 24.04) for destructive mode.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      PRERELEASE: ${{ github.event.release.prerelease }}
+      INPUT_CHANNEL: ${{ inputs.channel }}
+      EVENT: ${{ github.event_name }}
+      GH_TOKEN: ${{ github.token }}
+      WORK: ${{ github.workspace }}/snap-build
+    steps:
+      - name: Work out version and channel
+        id: meta
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # Snap version rules: max 32 chars, letters/digits/.+~-, starts and
+          # ends with a letter or digit.
+          if ! printf '%s' "$version" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.+~-]{0,30}[A-Za-z0-9])?$'; then
+            echo "::error::Tag is not a valid snap version (max 32 chars, letters, digits, . + ~ -)"
+            exit 1
+          fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            channel="$INPUT_CHANNEL"
+          elif [ "$PRERELEASE" = "true" ]; then
+            channel="beta"
+          else
+            channel="stable"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "Version $version -> $channel"
+
+      - name: Find the .deb in the release
+        id: deb
+        run: |
+          set -euo pipefail
+          names="$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -E '\.deb$' || true)"
+          if [ -z "$names" ]; then
+            echo "No .deb in this release, nothing to publish."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Prefer the amd64 build if there is more than one.
+          name="$(printf '%s\n' "$names" | grep -m1 amd64 || printf '%s\n' "$names" | head -n1)"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "Found $name"
+
+      - name: Download and unpack the .deb
+        if: steps.deb.outputs.found == 'true'
+        env:
+          DEB_NAME: ${{ steps.deb.outputs.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/dl" "$WORK/root"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p "$DEB_NAME" -D "$WORK/dl"
+          dpkg-deb -x "$WORK/dl/$DEB_NAME" "$WORK/root"
+
+      - name: Fix desktop file and icon for the snap
+        id: app
+        if: steps.deb.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          cd "$WORK/root"
+          desktop="$(find usr/share/applications -maxdepth 1 -name '*.desktop' | head -n1)"
+          if [ -z "$desktop" ]; then
+            echo "::error::No .desktop file in the .deb"
+            exit 1
+          fi
+          exec_bin="$(grep -m1 '^Exec=' "$desktop" | sed -E 's/^Exec=//; s/ .*//')"
+          exec_bin="$(basename "$exec_bin")"
+          if [ ! -x "usr/bin/$exec_bin" ]; then
+            echo "::error::Exec binary from the .desktop file not found in usr/bin"
+            exit 1
+          fi
+          icon_name="$(grep -m1 '^Icon=' "$desktop" | sed 's/^Icon=//')"
+          # Largest hicolor PNG for that icon name.
+          icon="$(find usr/share/icons/hicolor -path "*/apps/$icon_name.png" 2>/dev/null \
+            | awk -F/ '{ split($5, s, "x"); print s[1] "\t" $0 }' | sort -n | tail -n1 | cut -f2)"
+          if [ -z "$icon" ]; then
+            echo "::error::Icon '$icon_name' not found under usr/share/icons/hicolor"
+            exit 1
+          fi
+          # Inside a snap, Icon= has to be the icon's path in the snap.
+          sed -i "s|^Icon=.*|Icon=\${SNAP}/$icon|" "$desktop"
+          mkdir -p "$WORK/snap/gui"
+          cp "$icon" "$WORK/snap/gui/inspeqa.png"
+          echo "desktop=$desktop" >> "$GITHUB_OUTPUT"
+          echo "bin=usr/bin/$exec_bin" >> "$GITHUB_OUTPUT"
+          echo "Desktop file and icon ready"
+
+      - name: Write snapcraft.yaml
+        if: steps.deb.outputs.found == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          DESKTOP: ${{ steps.app.outputs.desktop }}
+          BIN: ${{ steps.app.outputs.bin }}
+        run: |
+          set -euo pipefail
+          # Tauri v2 uses webkit2gtk-4.1, which the core24 GNOME extension provides.
+          cat > "$WORK/snap/snapcraft.yaml" <<EOF
+          name: inspeqa
+          base: core24
+          version: '$VERSION'
+          summary: API and security testing
+          description: |
+            Inspeqa is an API and security testing tool for REST APIs.
+            Collections and environments are stored encrypted on your own machine.
+          grade: stable
+          confinement: strict
+          platforms:
+            amd64:
+              build-on: [amd64]
+              build-for: [amd64]
+
+          apps:
+            inspeqa:
+              command: $BIN
+              desktop: $DESKTOP
+              extensions: [gnome]
+              plugs:
+                - home
+                - network
+                - network-bind
+                - password-manager-service
+
+          parts:
+            inspeqa:
+              plugin: dump
+              source: root
+              stage-packages:
+                - libsecret-1-0
+          EOF
+
+      - name: Build the snap
+        if: steps.deb.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/snapcraft-build.log"
+          {
+            sudo snap install snapcraft --classic
+            cd "$WORK"
+            sudo snapcraft pack --destructive-mode
+          } > "$log" 2>&1 || {
+            echo "::error::Snap build failed, output follows"
+            cat "$log"
+            exit 1
+          }
+          ls "$WORK"/*.snap > /dev/null
+          echo "Snap built"
+
+      - name: Upload to the Snap Store
+        if: steps.deb.outputs.found == 'true'
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/snapcraft-upload.log"
+          snap_file="$(ls "$WORK"/*.snap | head -n1)"
+          snapcraft upload --release="$CHANNEL" "$snap_file" > "$log" 2>&1 || {
+            echo "::error::Upload failed, output follows"
+            cat "$log"
+            exit 1
+          }
+          echo "Uploaded to $CHANNEL"
