@@ -150,6 +150,7 @@ jobs:
                 - home
                 - network
                 - network-bind
+                - network-status
                 - password-manager-service
 
           parts:
