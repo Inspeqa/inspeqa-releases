@@ -168,18 +168,18 @@ jobs:
 
       - name: Build the snap
         if: steps.deb.outputs.found == 'true'
+        # It takes a minute or two. A stalled Store download would otherwise
+        # hold the job until the 60-minute limit with nothing to show for it.
+        timeout-minutes: 15
         run: |
           set -euo pipefail
-          log="$RUNNER_TEMP/snapcraft-build.log"
-          {
-            sudo snap install snapcraft --classic
-            cd "$WORK"
-            sudo snapcraft pack --destructive-mode
-          } > "$log" 2>&1 || {
-            echo "::error::Snap build failed, output follows"
-            cat "$log"
-            exit 1
-          }
+          # Output is shown live: this step uses no secrets, and a stall is
+          # only diagnosable if the log says where it stopped.
+          echo "::group::Install snapcraft"
+          sudo snap install snapcraft --classic
+          echo "::endgroup::"
+          cd "$WORK"
+          sudo snapcraft pack --destructive-mode --verbosity=brief < /dev/null
           ls "$WORK"/*.snap > /dev/null
           echo "Snap built"
 
